@@ -134,6 +134,8 @@ const CHANNEL_JID = '120363382023564830@newsletter';
 const CHANNEL_EMOJIS = ['❤️', '🫪', '👍🏻', '🤩', '⚡', '🗿', '😮'];
 const STATUS_EMOJIS = ['❤️', '🩶', '🔥', '🤍', '♦️', '🎉', '💚', '💯', '✨', '☢️', '😍', '🎊'];
 let hasFollowedChannel = false;
+// The start message is sent once per start of the bot, not on every WhatsApp reconnect.
+let startMessageSent = false;
 
 let boundedAttempts = 0;
 const MAX_BOUNDED_ATTEMPTS = 5;
@@ -1257,25 +1259,55 @@ client.ev.on('group-participants.update', async (group) => {
 
                 await activateCrons();
                 
-                let cmsg = `◈━━━━━━━━━━━━━━◈
+                // The start message is sent ONCE per start of the bot. WhatsApp drops and re-opens the
+                // connection from time to time; those reconnects must not send it again.
+                if (startMessageSent) {
+                    console.log('ℹ️ Reconnected - the start message was already sent, not sending it again.');
+                } else {
+                    startMessageSent = true;
+
+                    // Tells the owner where the settings are kept: a local file is wiped by hosts with a temporary disk.
+                    let storageLine = '';
+                    try {
+                        storageLine = require('./database/db').getBackend() === 'pg'
+                            ? '\n│❒ *Settings saved in*: *[ database ✅ ]*'
+                            : '\n│❒ *Settings saved in*: *[ local file - lost if the host wipes the disk ]*';
+                    } catch (e) { /* the line is optional */ }
+
+                    let cmsg = `◈━━━━━━━━━━━━━━◈
    *Bmb Tech Bot connected*
 ◈━━━━━━━━━━━━━━◈
 │❒ *Mode*: *[ ${md} ]*
-│❒ *Prefix*: *[ ${prefixe} ]*
+│❒ *Prefix*: *[ ${prefixe} ]*${storageLine}
 
 
 │❒ *Website by Bmb Tech*
 │❒ bmbtech.zone.id
 ◈━━━━━━━━━━━━━━◈`;
 
-                const ownerNum = (getConf('NUMERO_OWNER') || conf.NUMERO_OWNER || '').replace(/[^0-9]/g, '');
-                const startMsgTarget = ownerNum
-                    ? ownerNum + '@s.whatsapp.net'
-                    : (client.user.id || '').split(':')[0].split('@')[0] + '@s.whatsapp.net';
+                    const ownerNum = (getConf('NUMERO_OWNER') || conf.NUMERO_OWNER || '').replace(/[^0-9]/g, '');
+                    const startMsgTarget = ownerNum
+                        ? ownerNum + '@s.whatsapp.net'
+                        : (client.user.id || '').split(':')[0].split('@')[0] + '@s.whatsapp.net';
 
-                await client.sendMessage(startMsgTarget, { text: cmsg }).catch((e) => {
-                    console.log('⚠️ Could not send start message to', startMsgTarget, ':', e.message || e);
-                });
+                    try {
+                        if (buttonKit && typeof buttonKit.sendButtons === 'function') {
+                            // Buttons: [📜 MENU] opens the menu, [👑 OWNER] opens the owner info.
+                            await buttonKit.sendButtons(client, startMsgTarget, {
+                                body: cmsg,
+                                title: 'BMB-TECH',
+                                buttons: [
+                                    { text: '📜 MENU', id: `${prefixe}menu` },
+                                    { text: '👑 OWNER', id: `${prefixe}owner` },
+                                ],
+                            });
+                        } else {
+                            await client.sendMessage(startMsgTarget, { text: cmsg });
+                        }
+                    } catch (e) {
+                        console.log('⚠️ Could not send start message to', startMsgTarget, ':', e.message || e);
+                    }
+                }
             }
             else if (connection == "close") {
                 let raisonDeconnexion = new boom_1.Boom(lastDisconnect?.error)?.output.statusCode;
