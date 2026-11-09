@@ -100,6 +100,8 @@ let _ready = null;
 const PG_SCHEMA = [
     `CREATE TABLE IF NOT EXISTS lid_mapping (lid TEXT PRIMARY KEY, phone TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)`,
+    // The WhatsApp session (login + encryption keys). Kept here so it survives restarts of the host.
+    `CREATE TABLE IF NOT EXISTS auth_state (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS group_settings (
         jid TEXT PRIMARY KEY, antidelete INTEGER DEFAULT 1,
         events INTEGER DEFAULT 0, antidemote TEXT DEFAULT 'off', antipromote TEXT DEFAULT 'off',
@@ -158,6 +160,30 @@ _ready = (async () => {
 
 async function ensureReady() { await _ready; }
 function getBackend() { return _backend; }
+
+// ---------------------------------------------------------------------
+// WhatsApp session storage (PostgreSQL only - lib/dbAuthState.js uses it)
+// ---------------------------------------------------------------------
+async function authGet(key) {
+    if (_backend !== 'pg') return null;
+    const r = await _pg.query('SELECT value FROM auth_state WHERE key = $1', [key]);
+    return r.rows[0] ? r.rows[0].value : null;
+}
+async function authSet(key, value) {
+    if (_backend !== 'pg') return;
+    await _pg.query(
+        'INSERT INTO auth_state (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+        [key, value]
+    );
+}
+async function authDel(key) {
+    if (_backend !== 'pg') return;
+    await _pg.query('DELETE FROM auth_state WHERE key = $1', [key]);
+}
+async function authClear() {
+    if (_backend !== 'pg') return;
+    await _pg.query('DELETE FROM auth_state');
+}
 
 // ---------------------------------------------------------------------
 // Group settings
@@ -372,6 +398,10 @@ async function getPhoneFromLid(lid) {
 
 module.exports = {
     getBackend,
+    authGet,
+    authSet,
+    authDel,
+    authClear,
     getGroupSettings,
     updateGroupSetting,
     getSudoUsers,
