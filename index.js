@@ -4,6 +4,22 @@
 // lib/integrityGuard.js for what exactly this checks and why.
 require("./lib/integrityGuard").verifyIntegrity(__dirname);
 
+// The encryption library prints a whole session - including its PRIVATE KEYS - to the log every time it closes
+// or replaces one. Anyone who can read the logs (Heroku, log drains, screenshots) would see them. Keep the short
+// message so session changes stay visible, drop the secret part.
+(() => {
+    const sessionLogs = /^(Closing session|Closing open session|Removing old closed session|Opening session|Migrating session|Session already|Closing stale)/;
+    for (const level of ["log", "info", "warn"]) {
+        const original = console[level].bind(console);
+        console[level] = (...args) => {
+            if (typeof args[0] === "string" && sessionLogs.test(args[0])) {
+                return original("🔐 [signal]", args[0].replace(/:\s*$/, ""));
+            }
+            return original(...args);
+        };
+    }
+})();
+
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
   var desc = Object.getOwnPropertyDescriptor(m, k);
@@ -100,12 +116,21 @@ app.listen(PORT, () => {
 });
 async function authentification() {
     try {
-        if (!fs.existsSync(__dirname + "/public/creds.json")) {
+        const credsPath = __dirname + "/public/creds.json";
+        const hashPath = __dirname + "/public/.session_hash";
+        const sessionHash = require("crypto").createHash("sha256").update(String(session)).digest("hex");
+        const savedHash = fs.existsSync(hashPath) ? String(fs.readFileSync(hashPath, "utf8")).trim() : "";
+
+        if (!fs.existsSync(credsPath)) {
             console.log("connexion en cour ...");
-            await fs.writeFileSync(__dirname + "/public/creds.json", atob(session), "utf8");
+            await fs.writeFileSync(credsPath, atob(session), "utf8");
+            fs.writeFileSync(hashPath, sessionHash, "utf8");
         }
-        else if (fs.existsSync(__dirname + "/public/creds.json") && session != "zokk") {
-            await fs.writeFileSync(__dirname + "/public/creds.json", atob(session), "utf8");
+        else if (session != "zokk" && savedHash !== sessionHash) {
+            // A new SESSION_ID was pasted: use it. If it is the same one as before, the saved creds.json is
+            // kept - it holds the newest keys and overwriting it on every start breaks the encryption.
+            await fs.writeFileSync(credsPath, atob(session), "utf8");
+            fs.writeFileSync(hashPath, sessionHash, "utf8");
         }
     }
     catch (e) {
@@ -161,7 +186,16 @@ async function main() {
         await loadSettingsCache().catch((e) => console.log('⚠️ settings cache load failed:', e.message));
 
         const { version, isLatest } = await (0, baileys_1.fetchLatestBaileysVersion)();
-        const { state, saveCreds } = await (0, baileys_1.useMultiFileAuthState)(__dirname + "/public");
+        // With PostgreSQL (DATABASE_URL) the WhatsApp session is kept in the database, so it survives restarts of
+        // the host. Without it the ./public folder is used, exactly as before.
+        let dbAuth = null;
+        try {
+            dbAuth = await require("./lib/dbAuthState").useDbAuthState({ db: require("./database/db"), sessionB64: session });
+        } catch (e) {
+            console.log("⚠️ [AUTH] could not use the database for the session, using the ./public folder:", e && e.message ? e.message : e);
+        }
+        const { state, saveCreds } = dbAuth || await (0, baileys_1.useMultiFileAuthState)(__dirname + "/public");
+        if (!dbAuth) console.log("ℹ️ [AUTH] Session kept in ./public. Set DATABASE_URL (PostgreSQL) to keep it across restarts.");
         // Retry counter cache: WhatsApp asks the sender to send a message again when it could not be
         // decrypted (this happens most with iPhone senders). Without this cache the retries are not
         // counted properly and the resent message can arrive minutes late or never.
@@ -177,7 +211,7 @@ async function main() {
             msgRetryCounterCache,
             retryRequestDelayMs: 250,
             maxMsgRetryCount: 5,
-            logger: pino({ level: "silent" }),
+            logger: pino({ level: process.env.BAILEYS_LOG || "silent" }),
             browser: ['Bmb-Tech', "safari", "1.0.0"],
             printQRInTerminal: true,
             fireInitQueries: false,
@@ -277,14 +311,25 @@ const _chatDevice = new Map();
 client._chatDevice = _chatDevice;
 const _deviceOfId = (id) => /^3A.{18}$/.test(id || '') ? 'ios' : (/^3E.{20}$/.test(id || '') ? 'web' : (/^(.{21}|.{32})$/.test(id || '') ? 'android' : 'other'));
 client.ev.on("messages.upsert", (m) => {
-    const list = (m && m.messages) || [];
+    if (!m || m._split) return; // an extra message handed over below was already looked at with its batch
+    const list = m.messages || [];
     for (const x of list) {
         if (x && x.key && !x.key.fromMe && x.key.remoteJid) {
             _chatDevice.set(x.key.remoteJid, _deviceOfId(x.key.id));
             if (_chatDevice.size > 2000) _chatDevice.delete(_chatDevice.keys().next().value);
         }
+        // "Waiting for this message": the bot could not open it (encryption keys out of date). Instead of waiting
+        // minutes for the sender to retry, ask the main phone to send the message again.
+        if (x && x.key && !x.key.fromMe && !x.message && (x.messageStubType === 2 || x.messageStubType === "CIPHERTEXT")) {
+            console.log(`⚠️ [DECRYPT] a message from ${x.key.participant || x.key.remoteJid} could not be opened yet - asking the phone to send it again`);
+            try {
+                if (typeof client.requestPlaceholderResend === "function") {
+                    Promise.resolve(client.requestPlaceholderResend(x.key)).catch(() => {});
+                }
+            } catch (e) { /* the sender's own retry still works */ }
+        }
     }
-    if (list.length > 1 && !m._split) {
+    if (list.length > 1) {
         for (const extra of list.slice(1)) {
             setImmediate(() => client.ev.emit("messages.upsert", { ...m, messages: [extra], _split: true }));
         }
@@ -716,6 +761,15 @@ client.ev.on("messages.upsert", async (m) => {
             }
             console.log("message sent by: " + "[" + nomAuteurMessage + " : " + auteurMessage.split("@s.whatsapp.net")[0] + " ]");
             console.log("message type: " + mtype);
+            // How old is the message when it reaches the bot? (WhatsApp stamps it when the sender sends it.)
+            try {
+                const rawTime = ms.messageTimestamp;
+                const sentAt = rawTime && typeof rawTime === "object" && typeof rawTime.toNumber === "function" ? rawTime.toNumber() : Number(rawTime);
+                if (sentAt) {
+                    const age = Math.round(Date.now() / 1000 - sentAt);
+                    if (age > 20) console.log(`⏱️ [DELAY] this message was sent ${age}s (${Math.round(age / 60)} min) before it reached the bot`);
+                }
+            } catch (e) { /* only a log line */ }
             console.log("------ message content ------");
             console.log(texte);
             function groupeAdmin(membreGroupe) {
