@@ -42,65 +42,201 @@ const getContextInfo = (query = '', botName = BOT_NAME) => ({
   title: botName
 });
 
-// Download API: https://apis.davidcyril.name.ng
-// If your key is required, set the DAVIDCYRIL_API_KEY environment variable (sent as the X-API-Key header).
+// ---------------------------------------------------------------------------
+// DOWNLOAD SOURCES
+// Every source is tried in order; the first one that gives a link that WhatsApp can open wins.
+//   - davidcyril is first (it is the one that works best for this bot)
+//   - the others are backups: Knight, Prince, Hector, Yupra, EliteProTech, Okatsu, Prexzy, Izumi
+// Optional keys / addresses (environment variables):
+//   DAVIDCYRIL_API_KEY, KNIGHT_API_URL, KNIGHT_API_KEY, PRINCE_API_URL, PRINCE_API_KEY
+// ---------------------------------------------------------------------------
 const API_BASE = 'https://apis.davidcyril.name.ng';
 const API_KEY = process.env.DAVIDCYRIL_API_KEY || '';
-// Converting a video can take much longer than a song, so it gets more time before we give up.
+const KNIGHT_BASE = String(process.env.KNIGHT_API_URL || 'https://knightbotapi.stream').replace(/\/$/, '');
+const KNIGHT_KEY = process.env.KNIGHT_API_KEY || 'knight';
+const PRINCE_BASE = String(process.env.PRINCE_API_URL || 'https://api.princetechn.com').replace(/\/$/, '');
+const PRINCE_KEY = process.env.PRINCE_API_KEY || 'prince';
+
+// How long ONE source may take, and how long all sources together may take before we give up.
+// Converting a video takes much longer than a song, so it gets more time.
 const API_TIMEOUT_MS = { audio: 30000, video: 90000 };
+const TOTAL_BUDGET_MS = { audio: 150000, video: 300000 };
+const VIDEO_QUALITY = '360'; // small enough to send quickly, clear enough on a phone
 const MAX_VIDEO_BYTES = 90 * 1024 * 1024; // the biggest video the bot downloads itself
 
-/**
- * The endpoints, tried in this order until one gives a link.
- *   by "url" -> the YouTube link of the video that was found
- *   by "q"   -> the title of the video that was found (search endpoint)
- */
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const isHttp = (u) => typeof u === 'string' && /^https?:\/\//i.test(u);
+const pickUrl = (r) => {
+  const u = r && (r.download || r.dl_url || r.dl || r.downloadUrl || r.downloadURL);
+  return isHttp(u) ? u : null;
+};
+const anyLink = (r) => pickUrl(r) || (isHttp(r && r.download_url) ? r.download_url : null) || (isHttp(r && r.url) ? r.url : null) || (r && r.audio && isHttp(r.audio.url) ? r.audio.url : null);
+const isIpLocked = (u) => /googlevideo\.com|youtube\.com\/videoplayback/i.test(String(u || ''));
+const watchUrl = (video) => (video.videoId ? `https://youtu.be/${video.videoId}` : video.url);
+
+/** GET + JSON. Never throws on a bad HTTP code by itself: the message is made readable here. */
+async function getJson(url, params, c, headers = {}) {
+  const res = await axios.get(url, {
+    params,
+    timeout: c.timeout,
+    validateStatus: () => true,
+    headers: { Accept: 'application/json', 'User-Agent': UA, ...headers },
+  });
+  const data = res.data;
+  if (res.status >= 400) {
+    const why = data && typeof data === 'object' ? (data.message || data.error || (data.result && data.result.error) || '') : '';
+    throw new Error(`HTTP ${res.status}${why ? ' - ' + String(why).slice(0, 100) : ''}`);
+  }
+  return data;
+}
+const said = (data) => (data && typeof data === 'object' ? (data.message || data.error || (data.result && data.result.error) || '') : '');
+
+// quality helpers (from the other bot's api.js)
+const qualityNumber = (value, fallback = '360') => (String(value || '').match(/(\d{3,4})/) || [])[1] || fallback;
+function pickQualityUrl(videos, wanted = '360') {
+  if (!videos || typeof videos !== 'object' || Array.isArray(videos)) return null;
+  const ladder = ['1080', '720', '480', '360', '240', '144'];
+  const want = qualityNumber(wanted);
+  const start = Math.max(0, ladder.indexOf(want));
+  for (const q of ladder.slice(start).concat(ladder.slice(0, start))) {
+    const url = videos[q] || videos[`${q}p`];
+    if (isHttp(url)) return url;
+  }
+  return null;
+}
+
+// ----- davidcyril (apis.davidcyril.name.ng) -----
+const david = (name, path, by, pick) => ({
+  name,
+  run: async (c) => {
+    const headers = API_KEY ? { 'X-API-Key': API_KEY } : {};
+    const params = by === 'q' ? { q: c.video.title || c.query } : { url: c.video.url };
+    const data = await getJson(`${API_BASE}${path}`, params, c, headers);
+    const ok = data && (data.success === true || data.status === true || data.status === 200) && data.result;
+    const link = ok ? (pick(data.result) || anyLink(data.result)) : null;
+    if (!link) throw new Error(said(data) || 'no link in the answer');
+    return { downloadUrl: link, title: data.result.title || '' };
+  },
+});
+
+// ----- Knight -----
+const knight = (name, path, extra, pickFrom) => ({
+  name,
+  run: async (c) => {
+    const data = await getJson(`${KNIGHT_BASE}${path}`, { apikey: KNIGHT_KEY, url: watchUrl(c.video), ...extra }, c);
+    if (!data || !data.success) throw new Error(said(data) || 'no success');
+    const result = data.result || data;
+    const link = pickFrom ? pickFrom(result) : pickUrl(result);
+    if (!isHttp(link)) throw new Error('no download URL');
+    return { downloadUrl: link, title: result.title || '' };
+  },
+});
+
+// ----- Prince -----
+const prince = (name, path, extra, pickFrom) => ({
+  name,
+  run: async (c) => {
+    const data = await getJson(`${PRINCE_BASE}${path}`, { apikey: PRINCE_KEY, url: watchUrl(c.video), ...extra }, c);
+    const result = (data && data.result) || data;
+    if (!data || data.success === false || (result && result.error)) throw new Error(said(data) || (result && result.error) || 'failed');
+    const link = pickFrom(result);
+    if (!isHttp(link)) throw new Error('no download URL');
+    return { downloadUrl: link, title: (result && result.title) || '' };
+  },
+});
+
+// ----- Hector (one address for audio and video) -----
+const HECTOR_URL = 'https://yt-dl.officialhectormanuel.workers.dev';
+const hector = (name, pickFrom) => ({
+  name,
+  run: async (c) => {
+    const data = await getJson(HECTOR_URL, { url: watchUrl(c.video) }, c);
+    if (!data || data.status === false) throw new Error(said(data) || 'failed');
+    const link = pickFrom(data);
+    if (!isHttp(link) || /[?&]format=mp3(?:&|$)/i.test(link) && c.kind === 'video') throw new Error('no usable URL');
+    return { downloadUrl: link, title: data.title || '' };
+  },
+});
+
+// ----- the simple ones: one address, one field -----
+const simple = (name, url, params, check, pickFrom, titleFrom) => ({
+  name,
+  run: async (c) => {
+    const data = await getJson(url, params(c), c);
+    if (!check(data)) throw new Error(said(data) || 'no link in the answer');
+    const link = pickFrom(data);
+    if (!isHttp(link)) throw new Error('no download URL');
+    return { downloadUrl: link, title: (titleFrom && titleFrom(data)) || '' };
+  },
+});
+const ELITE = 'https://eliteprotech-apis.zone.id/ytdown';
+const YUPRA = 'https://api.yupra.my.id/api/downloader';
+const OKATSU = 'https://okatsu-rolezapiiz.vercel.app/downloader';
+
 const SOURCES = {
   audio: [
-    { path: '/download/ytmp3',    by: 'url', pick: (r) => r.download_url },     // YouTube MP3
-    { path: '/download/ytmp3-v2', by: 'url', pick: (r) => r.download },         // YouTube MP3 V2
-    { path: '/play-v2',          by: 'q',   pick: (r) => r.audio && r.audio.url }, // Play Music V2
+    david('davidcyril ytmp3', '/download/ytmp3', 'url', (r) => r.download_url),
+    david('davidcyril ytmp3-v2', '/download/ytmp3-v2', 'url', (r) => r.download),
+    david('davidcyril play-v2', '/play-v2', 'q', (r) => r.audio && r.audio.url),
+    knight('knight', '/api/download/ytaudio', { format: '128kbps' }),
+    prince('prince', '/api/download/ytmp3', {}, (r) => r.downloadUrl || pickUrl(r)),
+    hector('hector', (d) => d.audio),
+    simple('yupra', `${YUPRA}/ytmp3`, (c) => ({ url: watchUrl(c.video) }), (d) => d && d.success && d.data, (d) => d.data.download_url, (d) => d.data.title),
+    simple('elite', ELITE, (c) => ({ url: watchUrl(c.video), format: 'mp3' }), (d) => d && d.success, (d) => d.downloadURL, (d) => d.title),
+    simple('okatsu', `${OKATSU}/ytmp3`, (c) => ({ url: watchUrl(c.video) }), (d) => d && d.dl, (d) => d.dl, (d) => d.title),
+    simple('prexzy', 'https://prexzyapis.com/download/ytmp3', (c) => ({ url: watchUrl(c.video) }), (d) => d && d.status && d.download_url && !isIpLocked(d.download_url), (d) => d.download_url, (d) => d.info && d.info.title),
+    simple('izumi', 'https://izumiiiiiiii.dpdns.org/downloader/youtube', (c) => ({ url: watchUrl(c.video), format: 'mp3' }), (d) => d && d.result && d.result.download, (d) => d.result.download, (d) => d.result.title),
   ],
   video: [
-    { path: '/download/ytmp4',   by: 'url', pick: (r) => r.download_url },     // YouTube MP4
-    { path: '/youtube/mp444',    by: 'url', pick: (r) => r.url },               // YouTube MP4 (V2)
+    david('davidcyril ytmp4', '/download/ytmp4', 'url', (r) => r.download_url),
+    knight('knight', '/api/download/ytmp4', { format: `${VIDEO_QUALITY}p` }),
+    prince('prince', '/api/download/ytvideo', { quality: VIDEO_QUALITY },
+      (r) => (isHttp(r.downloadUrl || r.download_url || r.video || pickUrl(r)) ? (r.downloadUrl || r.download_url || r.video || pickUrl(r)) : pickQualityUrl(r.videos, VIDEO_QUALITY))),
+    hector('hector', (d) => pickQualityUrl(d.videos, VIDEO_QUALITY) || pickQualityUrl(d.result && d.result.videos, VIDEO_QUALITY)),
+    simple('yupra', `${YUPRA}/ytmp4`, (c) => ({ url: watchUrl(c.video) }), (d) => d && d.success && d.data, (d) => d.data.download_url, (d) => d.data.title),
+    simple('elite', ELITE, (c) => ({ url: watchUrl(c.video), format: 'mp4' }), (d) => d && d.success, (d) => d.downloadURL, (d) => d.title),
+    simple('okatsu', `${OKATSU}/ytmp4`, (c) => ({ url: watchUrl(c.video) }), (d) => d && d.result && d.result.mp4, (d) => d.result.mp4, (d) => d.result.title),
+    david('davidcyril mp4 v2', '/youtube/mp444', 'url', (r) => r.url), // its link is tied to one address, so it is the last resort
   ],
 };
-
-const anyLink = (r) => r.download_url || r.download || r.url || (r.audio && r.audio.url) || null;
 
 const shortError = (err) => {
   if (!err) return 'unknown error';
   const status = err.response && err.response.status;
   const body = err.response && err.response.data;
   const detail = body && typeof body === 'object' ? (body.message || body.error || JSON.stringify(body)) : (typeof body === 'string' ? body : '');
-  const base = err.code === 'ECONNABORTED' ? 'timed out' : (err.message || String(err));
+  const base = err.code === 'ECONNABORTED' || /timeout/i.test(err.message || '') ? 'timed out' : (err.message || String(err));
   return `${status ? 'HTTP ' + status + ' ' : ''}${base}${detail ? ' - ' + String(detail).slice(0, 120) : ''}`.slice(0, 220);
 };
 
-/** Asks ONE endpoint for a link. Throws when it has none. */
+/** Asks ONE source for a link. Throws when it has none. */
 async function fetchFromSource(kind, src, video, query) {
-  const headers = API_KEY ? { 'X-API-Key': API_KEY } : {};
-  const params = src.by === 'q' ? { q: video.title || query } : { url: video.url };
-  const response = await axios.get(`${API_BASE}${src.path}`, { params, headers, timeout: API_TIMEOUT_MS[kind] || 30000 });
-  const data = response && response.data;
-  const ok = data && (data.success === true || data.status === true || data.status === 200) && data.result;
-  const link = ok ? (src.pick(data.result) || anyLink(data.result)) : null;
-  if (!link) throw new Error('no link in the answer');
-  return { downloadUrl: link, title: data.result.title || '' };
+  return src.run({ kind, video, query, timeout: API_TIMEOUT_MS[kind] || 30000 });
+}
+
+/** The sources that are still allowed to run (the time budget is not used up). */
+function* sourcesWithinBudget(kind) {
+  const started = Date.now();
+  for (const src of SOURCES[kind]) {
+    if (Date.now() - started > (TOTAL_BUDGET_MS[kind] || 150000)) {
+      console.log('[PLAY] time budget used up, no more sources are tried');
+      return;
+    }
+    yield src;
+  }
 }
 
 /**
  * Gets a download link for the video that was found. kind: "audio" | "video".
- * Every endpoint is tried once; the next one is used when it fails.
+ * Every source is tried once; the next one is used when it fails.
  */
 async function getLink(kind, video, query) {
   const problems = [];
-  for (const src of SOURCES[kind]) {
+  for (const src of sourcesWithinBudget(kind)) {
     try {
       return await fetchFromSource(kind, src, video, query);
     } catch (err) {
-      problems.push(`${src.path}: ${shortError(err)}`);
+      problems.push(`${src.name}: ${shortError(err)}`);
       console.log('[PLAY] source failed, trying the next one:', problems[problems.length - 1]);
     }
   }
@@ -111,17 +247,17 @@ async function getLink(kind, video, query) {
 
 /**
  * Gets a link AND sends the file. If the file can not be sent (the link is dead, blocked, or WhatsApp
- * could not download it), the next endpoint is tried. `send(result)` does the actual sending.
+ * could not download it), the next source is tried. `send(result)` does the actual sending.
  */
 async function sendWithFallback(kind, video, query, send) {
   const problems = [];
-  for (const src of SOURCES[kind]) {
+  for (const src of sourcesWithinBudget(kind)) {
     try {
       const result = await fetchFromSource(kind, src, video, query);
       await send(result);
       return result;
     } catch (err) {
-      problems.push(`${src.path}: ${shortError(err)}`);
+      problems.push(`${src.name}: ${shortError(err)}`);
       console.log('[PLAY] source failed, trying the next one:', problems[problems.length - 1]);
     }
   }
@@ -364,7 +500,9 @@ function registerDeliver({ nomCom, kind, label, reaction }) {
         });
       } catch (err) {
         console.error(`[${nomCom.toUpperCase()}] Error:`, err && err.message ? err.message : err);
-        const why = err && err.details && err.details.length ? `\n\nReason:\n${err.details.join('\n')}` : '';
+        const shown = err && err.details ? err.details.slice(0, 3) : [];
+        const more = err && err.details && err.details.length > 3 ? `\n(+${err.details.length - 3} more sources failed, see the logs)` : '';
+        const why = shown.length ? `\n\nReason:\n${shown.join('\n')}${more}` : '';
         await text(client, origineMessage, ms, `Failed to send the ${label} file. Please try again in a moment.${why}`);
       }
     }
